@@ -1,0 +1,356 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="robots" content="noindex" />
+    <title>GPU sorting in WebGPU — Ryan Carty</title>
+    <meta
+      name="description"
+      content="A radix sort and a bitonic sort in WebGPU compute shaders, with a prefix sum, a live benchmark and a CUDA port."
+    />
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230d0e11'/%3E%3Cg fill='%237cc4ff'%3E%3Ccircle cx='13' cy='18.5' r='6.2'/%3E%3Ccircle cx='22.5' cy='11' r='4' fill-opacity='.75'/%3E%3Ccircle cx='23' cy='22' r='2.8' fill-opacity='.6'/%3E%3Ccircle cx='9' cy='8.5' r='2.2' fill-opacity='.5'/%3E%3Ccircle cx='16.5' cy='6.5' r='1.4' fill-opacity='.4'/%3E%3C/g%3E%3C/svg%3E"
+    />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&family=Space+Grotesk:wght@500;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="kit/demo/demo.css" />
+    <style>
+      .panel {
+        background: var(--card);
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        padding: 24px;
+        margin-top: 24px;
+      }
+      .panel h2 {
+        font-size: 22px;
+        margin-bottom: 6px;
+      }
+      .panel > p {
+        margin: 0 0 18px;
+        color: var(--muted);
+        font-size: 15px;
+      }
+      .panel .controls {
+        margin-bottom: 18px;
+      }
+      label.sel {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 14px;
+        color: var(--muted);
+      }
+      select {
+        min-height: 44px;
+        background: var(--bg);
+        color: var(--text);
+        border: 1px solid #343842;
+        border-radius: 8px;
+        padding: 0 10px;
+        font: inherit;
+        font-size: 14px;
+      }
+      canvas.plot {
+        width: 100%;
+        max-width: min(640px, 76vh);
+        height: auto;
+        margin: 0 auto;
+        display: block;
+        image-rendering: pixelated;
+        background: #0a0b0e;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+      }
+      .step {
+        min-height: 20px;
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: space-between;
+        gap: 8px;
+        margin-top: 10px;
+        font-size: 13px;
+        color: var(--muted);
+      }
+      input[type='range'] {
+        width: 100%;
+        accent-color: var(--accent);
+        margin-top: 12px;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 15px;
+      }
+      th,
+      td {
+        text-align: left;
+        padding: 12px 8px;
+        border-bottom: 1px solid var(--line);
+      }
+      th {
+        font-weight: 500;
+        color: var(--dim);
+        font-size: 13px;
+      }
+      td.num {
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 14px;
+        white-space: nowrap;
+      }
+      .bar {
+        height: 8px;
+        border-radius: 4px;
+        background: var(--accent);
+        min-width: 2px;
+      }
+      .bar.cpu {
+        background: var(--warm);
+      }
+      .ok {
+        color: #8be3b0;
+      }
+      .bad {
+        color: #ff8a80;
+      }
+      .panel h3.sub {
+        font-size: 17px;
+        margin: 28px 0 6px;
+      }
+      .file input {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        opacity: 0;
+      }
+      .file:focus-within {
+        outline: 2px solid var(--accent);
+        outline-offset: 2px;
+      }
+      .tablewrap {
+        overflow-x: auto;
+      }
+    </style>
+  </head>
+  <body>
+    <header class="top">
+      <div class="inner">
+        <a class="name" href="../index.html">Ryan Carty</a>
+        <nav aria-label="Main">
+          <a href="../index.html#work">Work</a
+          ><a href="../index.html#projects" aria-current="true">Projects</a
+          ><a href="../index.html#writing">Writing</a><a href="../index.html#contact">Contact</a
+          ><a href="https://github.com/rcarty">GitHub</a>
+        </nav>
+      </div>
+    </header>
+    <div class="wrap">
+      <section class="lead">
+        <h1>GPU sorting in WebGPU</h1>
+        <p>
+          Two parallel sorts and the prefix sum under them, written in WGSL compute shaders and
+          running on your GPU in this page: an LSD radix sort built on prefix sums and a bitonic
+          sorting network. Each is checked against the browser's own sort. The same algorithms are
+          ported to CUDA in the repository, so the numbers can be compared across APIs.
+        </p>
+        <p class="nogpu">
+          This browser doesn't support WebGPU, so the demos can't run here. Recent Chrome, Edge,
+          Safari and Firefox all support it.
+        </p>
+      </section>
+
+      <section class="panel" aria-labelledby="watch-h">
+        <h2 id="watch-h">Watch it sort a picture</h2>
+        <p>
+          The picture is 262,144 pixels, and each pixel's key is the place it belongs. The page
+          shuffles them, sorts the keys on your GPU and reads the array back after every pass. The
+          array is drawn row by row, so sorted runs of keys show up as small, rough copies of the
+          picture. Bitonic doubles the size of those copies at every stage until one is left, and
+          every other run is upside down because it sorts alternate runs in opposite directions.
+          Radix sorts the lowest digits first, so nothing shows until the last passes.
+        </p>
+        <div class="controls">
+          <div class="seg" role="group" aria-label="Algorithm">
+            <button type="button" id="vis-bitonic" aria-pressed="true">Bitonic</button>
+            <button type="button" id="vis-radix" aria-pressed="false">Radix</button>
+          </div>
+          <button type="button" class="btn" id="vis-play" disabled>Play</button>
+          <label class="btn file"
+            >Use your own picture<input type="file" id="vis-file" accept="image/*"
+          /></label>
+        </div>
+        <canvas
+          class="plot"
+          id="plot"
+          width="512"
+          height="512"
+          role="img"
+          aria-label="A picture whose pixels are shuffled, then sorted back into place one pass at a time"
+        ></canvas>
+        <input
+          type="range"
+          id="vis-step"
+          min="0"
+          max="11"
+          step="0.01"
+          value="0"
+          aria-label="Sort step"
+        />
+        <div class="step">
+          <span id="vis-label" class="mono">Sorting on the GPU…</span><span id="vis-desc"></span>
+        </div>
+      </section>
+
+      <section class="panel" aria-labelledby="bench-h">
+        <h2 id="bench-h">Benchmark</h2>
+        <p>
+          Each GPU sort runs five times after a warm-up, on a fresh copy of the same random keys,
+          and the median is shown. GPU times come from timestamp queries where the browser allows
+          them. The wall clock column times the same work from submit to completion as a
+          cross-check, so it includes a little overhead.
+        </p>
+        <div class="controls">
+          <label class="sel"
+            >Keys
+            <select id="bench-n">
+              <option value="65536">65,536</option>
+              <option value="1048576" selected>1,048,576</option>
+              <option value="4194304">4,194,304</option>
+              <option value="16777216">16,777,216</option>
+            </select>
+          </label>
+          <button type="button" class="btn primary" id="bench-run">Run benchmark</button>
+        </div>
+        <div class="tablewrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Sort</th>
+                <th>GPU time</th>
+                <th>Wall clock</th>
+                <th>Throughput</th>
+                <th style="width: 24%"></th>
+                <th>Result</th>
+              </tr>
+            </thead>
+            <tbody id="bench-body">
+              <tr>
+                <td>Radix, WebGPU</td>
+                <td class="num">–</td>
+                <td class="num">–</td>
+                <td class="num">–</td>
+                <td></td>
+                <td></td>
+              </tr>
+              <tr>
+                <td>Bitonic, WebGPU</td>
+                <td class="num">–</td>
+                <td class="num">–</td>
+                <td class="num">–</td>
+                <td></td>
+                <td></td>
+              </tr>
+              <tr>
+                <td>TypedArray.sort, CPU</td>
+                <td class="num">–</td>
+                <td class="num">–</td>
+                <td class="num">–</td>
+                <td></td>
+                <td></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <h3 class="sub">Prefix sum</h3>
+        <p>
+          The scan the radix sort is built on, run over the same values and checked against a CPU
+          loop.
+        </p>
+        <div class="tablewrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Scan</th>
+                <th>GPU time</th>
+                <th>Wall clock</th>
+                <th>Throughput</th>
+                <th style="width: 24%"></th>
+                <th>Result</th>
+              </tr>
+            </thead>
+            <tbody id="scan-body">
+              <tr>
+                <td>Prefix sum, WebGPU</td>
+                <td class="num">–</td>
+                <td class="num">–</td>
+                <td class="num">–</td>
+                <td></td>
+                <td></td>
+              </tr>
+              <tr>
+                <td>Loop, CPU</td>
+                <td class="num">–</td>
+                <td class="num">–</td>
+                <td class="num">–</td>
+                <td></td>
+                <td></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="status mono" id="bench-status" role="status"></div>
+      </section>
+
+      <section class="notes">
+        <div>
+          <h3>Prefix sum</h3>
+          <p>
+            An exclusive scan over 32-bit values. Each 256-element block is scanned in workgroup
+            memory, the block totals are scanned the same way one level up, and a second sweep adds
+            them back down. Three levels cover 16 million values. The radix sort calls it once per
+            pass to turn digit counts into output offsets.
+          </p>
+        </div>
+        <div>
+          <h3>Radix sort</h3>
+          <p>
+            Four bits per pass, eight passes for 32-bit keys. Each pass counts digits per 1,024-key
+            tile, runs a multi-level exclusive prefix sum over the counts, then scatters. The
+            scatter ranks keys inside a tile with a workgroup scan over sixteen packed 16-bit
+            counters, so the sort stays stable without atomics on the output.
+          </p>
+        </div>
+        <div>
+          <h3>Bitonic sort</h3>
+          <p>
+            A sorting network with O(n log² n) compares. Steps that stay within a 512-key tile run
+            in workgroup memory in one dispatch. Longer strides go to global memory, one dispatch
+            per step. It does more work than radix but every step is the same shape, which makes it
+            a useful baseline.
+          </p>
+        </div>
+        <div>
+          <h3>CUDA port</h3>
+          <p>
+            The repository has the same two sorts and the prefix sum in CUDA, with the same tile
+            sizes and digit width, benchmarked against the CPU and CUB's radix sort and scan. On an
+            RTX 2080 Ti it sorts 16.7 million keys in 16.3 ms with radix and 30.0 ms with bitonic,
+            almost exactly what the WebGPU versions take. CUB's radix sort does it in 1.66 ms.
+          </p>
+        </div>
+      </section>
+    </div>
+
+    <script type="module" src="src/main.js"></script>
+    <script
+      data-goatcounter="https://rcarty.goatcounter.com/count"
+      async
+      src="https://gc.zgo.at/count.js"
+    ></script>
+  </body>
+</html>
